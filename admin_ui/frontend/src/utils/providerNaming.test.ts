@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { getEffectiveFullAgentKind } from './providerNaming';
+import { getEffectiveFullAgentKind, isFullAgentProvider } from './providerNaming';
 
 /**
  * Regression coverage for GitHub issue #436: a canonical Google Live provider
@@ -14,6 +14,7 @@ import { getEffectiveFullAgentKind } from './providerNaming';
 describe('getEffectiveFullAgentKind', () => {
     it('resolves canonical google_live with legacy type:full to google_live (#436)', () => {
         expect(getEffectiveFullAgentKind({ type: 'full' }, 'google_live')).toBe('google_live');
+        expect(isFullAgentProvider({ type: 'full' })).toBe(true);
     });
 
     it('returns the concrete kind when an explicit full-agent type is set', () => {
@@ -31,15 +32,17 @@ describe('getEffectiveFullAgentKind', () => {
 
     it('does not name-guess a kind for a neutral custom key with type:full', () => {
         expect(getEffectiveFullAgentKind({ type: 'full' }, 'my_custom_agent')).toBeNull();
+        expect(isFullAgentProvider({ type: 'full' }, 'my_custom_agent')).toBe(false);
     });
 
     it('returns null for a modular single-capability provider (type:local is not a full agent)', () => {
         expect(getEffectiveFullAgentKind({ type: 'local', capabilities: ['stt'] }, 'local_stt')).toBeNull();
+        expect(isFullAgentProvider({ type: 'local', capabilities: ['stt'] }, 'local_stt')).toBe(false);
     });
 
-    it('resolves type:local WITH all three capabilities to local (monolithic Local full agent)', () => {
-        // The Provider Type dropdown's "Local" option saves type:'local' with full
-        // capabilities; this must remain a savable full agent (regression: #440 review).
+    it('resolves non-modular type:local provider instances to local full agents', () => {
         expect(getEffectiveFullAgentKind({ type: 'local', capabilities: ['stt', 'llm', 'tts'] }, 'local')).toBe('local');
+        expect(getEffectiveFullAgentKind({ type: 'local' }, 'office_local')).toBe('local');
+        expect(isFullAgentProvider({ type: 'local' }, 'office_local')).toBe(true);
     });
 });
