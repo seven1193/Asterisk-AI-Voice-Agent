@@ -127,9 +127,9 @@ pipelines:
 
 **Transfer Types**:
 
-- **Extension**: Direct dial to specific agent (uses ARI `continue` to the configured dialplan context, default `from-internal`)
-- **Queue**: Transfer to ACD queue for next available agent (uses ARI `continue` to `ext-queues`)
-- **Ring Group**: Transfer to ring group that rings multiple agents (uses ARI `continue` to `ext-group`)
+- **Extension**: Direct dial to specific agent (uses ARI `continue` to the destination/default dialplan context, default `from-internal`)
+- **Queue**: Transfer to ACD queue for next available agent (uses ARI `continue` to the destination/default dialplan context, default `ext-queues`)
+- **Ring Group**: Transfer to ring group that rings multiple agents (uses ARI `continue` to the destination/default dialplan context, default `ext-group`)
 
 **Key Features**:
 - Single unified interface for all transfer types
@@ -156,7 +156,8 @@ AI: "Transferring you to Sales team ring group now."
 ```
 
 **Technical Implementation**:
-- Extension transfers use `continue` to the configured dialplan context (e.g., `from-internal`)
+- Transfer tools can defer the ARI action until caller-facing playback completes, so the handoff sentence is not cut off
+- Dialplan context precedence is `destinations.<key>.dialplan_context`, then the type default (`extension_context`, `queue_context`, `ringgroup_context`), then built-in FreePBX defaults
 - Queue/Ring Group transfers use `continue` (channel leaves Stasis, `transfer_active` flag prevents premature hangup)
 - All transfer types verified in production
 
@@ -775,13 +776,23 @@ tools:
   # ----------------------------------------------------------------------------
   transfer:
     enabled: true
+    technology: "PJSIP"                    # Channel technology for direct extension dialing
+    defer_until_playback_complete: true    # Speak handoff text before blind/live/attended transfer actions
+    deferred_strategy: "drain_then_dial"   # Or "predial_then_bridge" to dial while handoff audio plays
+    predial_bridge_wait_timeout_sec: 10    # Wait after handoff audio for a predialed destination answer
+    predial_timeout_seconds: 30            # Asterisk originate timeout for predialed destination leg
+    predial_wait_moh_class: "default"      # MOH class while waiting for predial destination answer
+    extension_context: "from-internal"     # Default for extension destinations
+    queue_context: "ext-queues"            # Default for queue destinations
+    ringgroup_context: "ext-group"         # Default for ring group destinations
     destinations:
-      # Direct extension transfers (using redirect - stays in Stasis)
+      # Direct extension transfers
       sales_agent:
         type: extension
         target: "2765"
         description: "Sales agent"
-        attended_allowed: true         # Allows attended_transfer (warm transfer) to this destination
+        dialplan_context: "from-internal"  # Optional per-destination override
+        attended_allowed: true             # Allows attended_transfer (warm transfer) to this destination
       
       support_agent:
         type: extension
@@ -794,6 +805,7 @@ tools:
         type: queue
         target: "300"
         description: "Sales team queue"
+        dialplan_context: "ext-queues"  # Optional per-destination override
       
       support_queue:
         type: queue
@@ -810,6 +822,7 @@ tools:
         type: ringgroup
         target: "600"
         description: "Sales team ring group"
+        dialplan_context: "ext-group"  # Optional per-destination override
       
       support_team:
         type: ringgroup

@@ -19,7 +19,7 @@ import sqlite3
 from collections import deque
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, Optional, List, Set, Tuple, Callable
+from typing import TYPE_CHECKING, Dict, Any, Optional, List, Set, Tuple, Callable
 
 # Simple audio capture system removed - not used in production
 
@@ -79,6 +79,9 @@ from src.tools.telephony.hangup_policy import (
     text_is_short_polite_closing,
     normalize_marker_list,
 )
+
+if TYPE_CHECKING:
+    from src.tools.context import ToolExecutionContext
 
 logger = get_logger(__name__)
 
@@ -270,6 +273,8 @@ class Engine:
         self._attended_transfer_dtmf_waiters: Dict[str, asyncio.Future] = {}
         self._attended_transfer_dtmf_digits: Dict[str, str] = {}
         self._attended_transfer_agent_channel_to_call_id: Dict[str, str] = {}
+        self._predial_transfer_channel_to_call_id: Dict[str, str] = {}
+        self._predial_bridge_in_progress: Set[str] = set()
         self._attended_transfer_helper_state_by_agent_channel: Dict[str, Dict[str, Any]] = {}
         self._attended_transfer_helper_external_media_to_agent_channel: Dict[str, str] = {}
         self._attended_transfer_screening_state_by_call: Dict[str, Dict[str, Any]] = {}
@@ -4002,6 +4007,7 @@ class Engine:
         handlers = {
             'transfer': self._handle_transfer_answered,
             'warm-transfer': self._handle_transfer_answered,  # Warm transfer uses same handler
+            'predial-transfer': self._handle_predial_transfer_answered,
             'attended-transfer': self._handle_attended_transfer_answered,
             'transfer-failed': self._handle_transfer_failed,
             'voicemail-complete': self._handle_voicemail_complete,
@@ -4129,6 +4135,298 @@ class Engine:
             logger.error(f"🔀 TRANSFER - Failed to bridge: {e}",
                         channel_id=channel_id)
             await self.ari_client.hangup_channel(channel_id)
+
+    def register_predial_transfer_channel(self, call_id: str, channel_id: str) -> None:
+        """Register a predial destination leg so cleanup can resolve it back to the caller call."""
+        if channel_id:
+            self._predial_transfer_channel_to_call_id[channel_id] = call_id
+            self._seen_aux_channels.add(channel_id)
+
+    def _unregister_predial_transfer_channel(self, channel_id: str) -> None:
+        if channel_id:
+            self._predial_transfer_channel_to_call_id.pop(channel_id, None)
+
+    async def _handle_predial_transfer_answered(self, channel_id: str, args: list):
+        """
+        Handle a predial transfer destination leg entering Stasis on answer.
+        Args: ['predial-transfer', caller_id, destination_key]
+        """
+        caller_id = args[1] if len(args) > 1 else None
+        destination_key = args[2] if len(args) > 2 else ""
+        if not caller_id:
+            logger.error("Predial transfer answered without caller id", channel_id=channel_id, args=args)
+            await self.ari_client.hangup_channel(channel_id)
+            return
+
+        self.register_predial_transfer_channel(caller_id, channel_id)
+        session = await self.session_store.get_by_call_id(caller_id)
+        if not session:
+            logger.error("Predial transfer answered but session was not found", call_id=caller_id, channel_id=channel_id)
+            self._unregister_predial_transfer_channel(channel_id)
+            await self.ari_client.hangup_channel(channel_id)
+            return
+
+        action = dict(getattr(session, "current_action", None) or {})
+        if action.get("type") != "predial_transfer":
+            logger.info(
+                "Predial transfer answered but no matching action is active; hanging up destination leg",
+                call_id=caller_id,
+                channel_id=channel_id,
+                action_type=action.get("type"),
+            )
+            self._unregister_predial_transfer_channel(channel_id)
+            await self.ari_client.hangup_channel(channel_id)
+            return
+
+        action["answered"] = True
+        action["predial_channel_id"] = channel_id
+        if destination_key and not action.get("destination_key"):
+            action["destination_key"] = destination_key
+        session.current_action = action
+        await self._save_session(session)
+
+        logger.info(
+            "Predial transfer destination answered",
+            call_id=caller_id,
+            channel_id=channel_id,
+            destination_key=destination_key,
+            ready_to_bridge=bool(action.get("ready_to_bridge")),
+        )
+
+        if action.get("ready_to_bridge"):
+            await self._finalize_predial_transfer_bridge(session, channel_id)
+
+    async def finalize_predial_transfer(self, context: "ToolExecutionContext", action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Called after caller-facing transfer audio drains; bridge an answered predial leg."""
+        call_id = context.call_id
+        transfer_cfg = {}
+        try:
+            tools_cfg = getattr(self.config, "tools", {}) or {}
+            transfer_cfg = tools_cfg.get("transfer") if isinstance(tools_cfg, dict) else {}
+            if not isinstance(transfer_cfg, dict):
+                transfer_cfg = {}
+        except Exception:
+            transfer_cfg = {}
+
+        try:
+            wait_timeout = float(transfer_cfg.get("predial_bridge_wait_timeout_sec", 10.0) or 10.0)
+        except (TypeError, ValueError):
+            wait_timeout = 10.0
+        wait_timeout = max(0.0, min(wait_timeout, 60.0))
+        moh_class = str(transfer_cfg.get("predial_wait_moh_class", "default") or "default")
+
+        session = await self.session_store.get_by_call_id(call_id)
+        if not session:
+            return {"status": "failed", "message": "Call session is no longer available for predial transfer."}
+
+        current = dict(getattr(session, "current_action", None) or {})
+        if current.get("type") != "predial_transfer":
+            return {"status": "failed", "message": "Predial transfer state is no longer active."}
+
+        current["ready_to_bridge"] = True
+        session.current_action = current
+        await self._save_session(session)
+
+        started_at = time.time()
+        moh_started = False
+        while (time.time() - started_at) <= wait_timeout:
+            session = await self.session_store.get_by_call_id(call_id)
+            if not session:
+                return {"status": "failed", "message": "Call session ended before predial transfer completed."}
+            current = dict(getattr(session, "current_action", None) or {})
+            predial_channel_id = str(
+                current.get("predial_channel_id")
+                or ((action.get("payload") or {}).get("predial") or {}).get("channel_id")
+                or ""
+            ).strip()
+            if current.get("bridged"):
+                return {
+                    "status": "success",
+                    "message": f"Transferring you to {current.get('target_name') or action.get('description') or 'the destination'} now.",
+                    "destination": current.get("target") or action.get("target"),
+                    "type": current.get("transfer_type") or action.get("transfer_type"),
+                    "strategy": "predial_then_bridge",
+                }
+            if predial_channel_id and current.get("answered"):
+                ok = await self._finalize_predial_transfer_bridge(session, predial_channel_id)
+                if ok:
+                    return {
+                        "status": "success",
+                        "message": f"Transferring you to {current.get('target_name') or action.get('description') or 'the destination'} now.",
+                        "destination": current.get("target") or action.get("target"),
+                        "type": current.get("transfer_type") or action.get("transfer_type"),
+                        "strategy": "predial_then_bridge",
+                    }
+                return {"status": "failed", "message": "Predial destination answered, but bridging failed."}
+
+            if not moh_started and moh_class:
+                try:
+                    await self.ari_client.send_command(
+                        method="POST",
+                        resource=f"channels/{session.caller_channel_id}/moh",
+                        params={"mohClass": moh_class},
+                    )
+                    moh_started = True
+                except Exception:
+                    logger.debug("Failed to start predial wait MOH", call_id=call_id, exc_info=True)
+
+            await asyncio.sleep(0.05)
+
+        session = await self.session_store.get_by_call_id(call_id)
+        current = dict(getattr(session, "current_action", None) or {}) if session else {}
+        predial_channel_id = str(current.get("predial_channel_id") or "").strip()
+        if predial_channel_id:
+            self._unregister_predial_transfer_channel(predial_channel_id)
+            with contextlib.suppress(Exception):
+                await self.ari_client.hangup_channel(predial_channel_id)
+        if session:
+            with contextlib.suppress(Exception):
+                await self.ari_client.send_command(method="DELETE", resource=f"channels/{session.caller_channel_id}/moh")
+            session.current_action = None
+            await self._save_session(session)
+        return {"status": "failed", "message": "Predial destination did not answer before the bridge timeout."}
+
+    async def _finalize_predial_transfer_bridge(self, session: "CallSession", predial_channel_id: str) -> bool:
+        call_id = session.call_id
+        action = dict(getattr(session, "current_action", None) or {})
+        if action.get("bridged"):
+            return True
+
+        bridge_guard = getattr(self, "_predial_bridge_in_progress", None)
+        if bridge_guard is None:
+            bridge_guard = set()
+            self._predial_bridge_in_progress = bridge_guard
+        if call_id in bridge_guard:
+            deadline = time.time() + 5.0
+            while call_id in bridge_guard and time.time() < deadline:
+                await asyncio.sleep(0.025)
+            try:
+                latest = await self.session_store.get_by_call_id(call_id)
+                latest_action = dict(getattr(latest, "current_action", None) or {}) if latest else {}
+                if latest_action.get("bridged"):
+                    return True
+                if latest_action.get("type") != "predial_transfer":
+                    return False
+            except Exception:
+                logger.debug("Failed to inspect predial bridge state while finalize was in progress", call_id=call_id, exc_info=True)
+            if call_id in bridge_guard:
+                logger.info("Predial bridge finalize already in progress", call_id=call_id, predial_channel_id=predial_channel_id)
+                return False
+            return False
+
+        bridge_guard.add(call_id)
+        try:
+            try:
+                await self.ari_client.send_command(method="DELETE", resource=f"channels/{session.caller_channel_id}/moh")
+            except Exception:
+                pass
+
+            try:
+                if session.external_media_id:
+                    await self.ari_client.remove_channel_from_bridge(session.bridge_id, session.external_media_id)
+                if session.audiosocket_channel_id:
+                    await self.ari_client.remove_channel_from_bridge(session.bridge_id, session.audiosocket_channel_id)
+            except Exception:
+                logger.debug("Failed to remove AI media channels during predial transfer", call_id=call_id, exc_info=True)
+
+            provider = self._call_providers.pop(call_id, None)
+            try:
+                start_task = self._provider_start_tasks.pop(call_id, None)
+                if start_task:
+                    start_task.cancel()
+                task = getattr(self, "_pipeline_tasks", {}).pop(call_id, None)
+                if task and not task.done():
+                    task.cancel()
+                getattr(self, "_pipeline_queues", {}).pop(call_id, None)
+                getattr(self, "_pipeline_transcript_queues", {}).pop(call_id, None)
+                self._pipeline_forced.pop(call_id, None)
+            except Exception:
+                logger.debug("Failed to stop predial provider tasks", call_id=call_id, exc_info=True)
+
+            if not await self.ari_client.add_channel_to_bridge(session.bridge_id, predial_channel_id):
+                self._unregister_predial_transfer_channel(predial_channel_id)
+                try:
+                    await self.ari_client.hangup_channel(predial_channel_id)
+                except Exception:
+                    logger.debug("Failed to hang up failed predial destination leg", call_id=call_id, predial_channel_id=predial_channel_id, exc_info=True)
+                try:
+                    latest = await self.session_store.get_by_call_id(call_id) or session
+                    latest_action = dict(getattr(latest, "current_action", None) or {})
+                    if latest_action.get("type") == "predial_transfer":
+                        latest.current_action = None
+                        await self._save_session(latest)
+                except Exception:
+                    logger.debug("Failed to clear predial action after bridge failure", call_id=call_id, exc_info=True)
+                if provider and hasattr(provider, "stop_session"):
+                    self._fire_and_forget(
+                        self._stop_provider_after_predial_bridge(call_id, provider, getattr(session, "provider_name", None)),
+                        name=f"predial-provider-stop-failed-{call_id}",
+                    )
+                return False
+
+            try:
+                session = await self.session_store.get_by_call_id(call_id) or session
+                action = dict(getattr(session, "current_action", None) or {})
+                action["answered"] = True
+                action["bridged"] = True
+                action["predial_channel_id"] = predial_channel_id
+                action["channel_id"] = predial_channel_id
+                session.current_action = action
+                session.transfer_state = "bridged"
+                session.transfer_destination = str(action.get("target_name") or action.get("target") or "")
+                await self._save_session(session)
+            except Exception:
+                logger.debug("Failed to persist predial transfer bridge state", call_id=call_id, exc_info=True)
+
+            logger.info(
+                "Predial transfer bridged",
+                call_id=call_id,
+                predial_channel_id=predial_channel_id,
+                bridge_id=getattr(session, "bridge_id", None),
+                destination=getattr(session, "transfer_destination", None),
+            )
+            if provider and hasattr(provider, "stop_session"):
+                self._fire_and_forget(
+                    self._stop_provider_after_predial_bridge(call_id, provider, getattr(session, "provider_name", None)),
+                    name=f"predial-provider-stop-{call_id}",
+                )
+            return True
+        finally:
+            bridge_guard.discard(call_id)
+
+    async def _handle_unbridged_predial_transfer_channel_end(self, session: "CallSession", predial_channel_id: str) -> None:
+        """Handle a predial destination leg ending before it is bridged to the caller."""
+        call_id = session.call_id
+        self._unregister_predial_transfer_channel(predial_channel_id)
+        try:
+            latest = await self.session_store.get_by_call_id(call_id) or session
+            action = dict(getattr(latest, "current_action", None) or {})
+            if action.get("type") == "predial_transfer" and not action.get("bridged"):
+                latest.current_action = None
+                await self._save_session(latest)
+        except Exception:
+            logger.debug(
+                "Failed to clear unbridged predial transfer state",
+                call_id=call_id,
+                predial_channel_id=predial_channel_id,
+                exc_info=True,
+            )
+        logger.info(
+            "Ignoring unbridged predial transfer destination leg cleanup",
+            call_id=call_id,
+            predial_channel_id=predial_channel_id,
+        )
+
+    async def _stop_provider_after_predial_bridge(self, call_id: str, provider: Any, provider_name: Optional[str]) -> None:
+        try:
+            await provider.stop_session()
+            logger.info(
+                "AI provider session stopped after predial bridge",
+                call_id=call_id,
+                provider=provider_name,
+            )
+        except Exception:
+            logger.debug("Failed to stop provider after predial bridge", call_id=call_id, exc_info=True)
 
     def register_attended_transfer_agent_channel(self, call_id: str, agent_channel_id: str) -> None:
         """Register an attended transfer agent channel to resolve DTMF events back to a call."""
@@ -5867,6 +6165,17 @@ class Engine:
                 if mapped_call_id:
                     session = await self.session_store.get_by_call_id(mapped_call_id)
             if not session:
+                predial_channel_map = getattr(self, "_predial_transfer_channel_to_call_id", {})
+                mapped_call_id = predial_channel_map.get(channel_or_call_id)
+                if mapped_call_id:
+                    mapped_session = await self.session_store.get_by_call_id(mapped_call_id)
+                    if mapped_session:
+                        action = dict(getattr(mapped_session, "current_action", None) or {})
+                        if action.get("type") != "predial_transfer" or not action.get("bridged"):
+                            await self._handle_unbridged_predial_transfer_channel_end(mapped_session, channel_or_call_id)
+                            return
+                        session = mapped_session
+            if not session:
                 logger.debug("No session found during cleanup", identifier=channel_or_call_id)
                 # Codex P1: a single call has multiple channels (caller + aux media legs:
                 # Local/AudioSocket/ExternalMedia). Aux legs are destroyed AFTER the main
@@ -6037,6 +6346,9 @@ class Engine:
                     # Legacy warm transfer path used `channel_id`
                     if action.get("channel_id"):
                         action_channels.append(str(action.get("channel_id")))
+                    # Predial transfer destination leg.
+                    if action.get("predial_channel_id"):
+                        action_channels.append(str(action.get("predial_channel_id")))
             except Exception:
                 action_channels = []
 
@@ -6288,6 +6600,15 @@ class Engine:
                 ]
                 for ch in stale:
                     self._unregister_attended_transfer_agent_channel(ch)
+            except Exception:
+                pass
+            try:
+                stale_predial = [
+                    ch for ch, cid in self._predial_transfer_channel_to_call_id.items()
+                    if cid == call_id
+                ]
+                for ch in stale_predial:
+                    self._unregister_predial_transfer_channel(ch)
             except Exception:
                 pass
 
@@ -10081,6 +10402,9 @@ class Engine:
                 if streaming_done:
                     try:
                         session = await self.session_store.get_by_call_id(call_id)
+                        if session and isinstance(getattr(session, "pending_deferred_transfer", None), dict):
+                            await self._commit_pending_deferred_transfer_for_call(call_id, session)
+                            return
                         if session and getattr(session, 'cleanup_after_tts', False):
                             logger.info("🔚 Cleanup after TTS requested - hanging up call", call_id=call_id)
                             # Delay to ensure audio completes through RTP pipeline.
@@ -11169,7 +11493,7 @@ class Engine:
                                     )
                                     # Wait for filler playback to finish, then release the
                                     # streaming slot so the real LLM→TTS overlap can use it.
-                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id, drain=True)
                                     # Backdate tts_ended_ts so the post_tts_end_protection_ms
                                     # window has already expired. This avoids blocking barge-in
                                     # between filler and real response, while keeping the echo
@@ -11779,6 +12103,45 @@ class Engine:
                                     except Exception:
                                         logger.debug("Failed to log pipeline tool call to session", call_id=call_id, exc_info=True)
 
+                                    try:
+                                        from src.tools.telephony.deferred_transfer import get_deferred_transfer_action
+                                        deferred_action = get_deferred_transfer_action(result)
+                                    except Exception:
+                                        deferred_action = None
+
+                                    if deferred_action:
+                                        transfer_message = str(result.get("message") or "").strip()
+                                        if transfer_message:
+                                            try:
+                                                conversation_history.append(_ts_msg("assistant", transfer_message))
+                                                session.conversation_history = list(conversation_history)
+                                                await self.session_store.upsert_call(session)
+                                            except Exception:
+                                                logger.debug("Failed to record deferred transfer message", call_id=call_id, exc_info=True)
+
+                                            try:
+                                                transfer_bytes = bytearray()
+                                                async for chunk in pipeline.tts_adapter.synthesize(call_id, transfer_message, pipeline.tts_options):
+                                                    if chunk:
+                                                        transfer_bytes.extend(chunk)
+                                                if transfer_bytes:
+                                                    transfer_pid = await self.playback_manager.play_audio(
+                                                        call_id,
+                                                        bytes(transfer_bytes),
+                                                        "pipeline-transfer",
+                                                    )
+                                                    if transfer_pid:
+                                                        await self.playback_manager.wait_for_playback_end(
+                                                            call_id,
+                                                            transfer_pid,
+                                                            timeout_sec=(len(transfer_bytes) / 8000.0 + 3.0),
+                                                        )
+                                            except Exception:
+                                                logger.error("Deferred transfer TTS failed; committing transfer anyway", call_id=call_id, exc_info=True)
+
+                                        await self._commit_pending_deferred_transfer_for_call(call_id, session)
+                                        return
+
                                     # Handle Hangup (AAVA-85 Fix)
                                     if result.get("will_hangup"):
                                         farewell = result.get("message")
@@ -11916,6 +12279,38 @@ class Engine:
                                                                     except Exception:
                                                                         logger.debug("Failed to speak slow-response message", call_id=call_id, exc_info=True)
                                                             next_result = await next_task
+                                                            try:
+                                                                from src.tools.telephony.deferred_transfer import get_deferred_transfer_action
+                                                                next_deferred_action = get_deferred_transfer_action(next_result)
+                                                            except Exception:
+                                                                next_deferred_action = None
+                                                            if next_deferred_action:
+                                                                transfer_message = str(next_result.get("message") or "").strip()
+                                                                if transfer_message:
+                                                                    try:
+                                                                        conversation_history.append(_ts_msg("assistant", transfer_message))
+                                                                        session.conversation_history = list(conversation_history)
+                                                                        await self.session_store.upsert_call(session)
+                                                                    except Exception:
+                                                                        logger.debug("Failed to record follow-up deferred transfer message", call_id=call_id, exc_info=True)
+
+                                                                    try:
+                                                                        transfer_bytes = bytearray()
+                                                                        async for chunk in pipeline.tts_adapter.synthesize(call_id, transfer_message, pipeline.tts_options):
+                                                                            if chunk:
+                                                                                transfer_bytes.extend(chunk)
+                                                                        if transfer_bytes:
+                                                                            transfer_pid = await self.playback_manager.play_audio(call_id, bytes(transfer_bytes), "pipeline-transfer")
+                                                                            if transfer_pid:
+                                                                                await self.playback_manager.wait_for_playback_end(
+                                                                                    call_id,
+                                                                                    transfer_pid,
+                                                                                    timeout_sec=(len(transfer_bytes) / 8000.0 + 3.0),
+                                                                                )
+                                                                    except Exception:
+                                                                        logger.error("Follow-up deferred transfer TTS failed; committing transfer anyway", call_id=call_id, exc_info=True)
+                                                                await self._commit_pending_deferred_transfer_for_call(call_id, session)
+                                                                return
                                                             if next_result.get("will_hangup"):
                                                                 farewell = next_result.get("message", "Goodbye!")
                                                                 conversation_history.append(_ts_msg("assistant", farewell))
@@ -13870,6 +14265,8 @@ class Engine:
                 try:
                     provider._caller_channel_id = session.caller_channel_id
                     provider._bridge_id = session.bridge_id
+                    provider._caller_number = getattr(session, 'caller_number', None)
+                    provider._caller_name = getattr(session, 'caller_name', None)
                     provider._called_number = getattr(session, 'called_number', None)
                     provider._context_name = getattr(session, 'context_name', None)
                     provider._session_store = self.session_store
@@ -14397,6 +14794,251 @@ class Engine:
                 )
         
         return result
+
+    async def _commit_pending_deferred_transfer_for_call(
+        self,
+        call_id: str,
+        session: Optional["CallSession"] = None,
+    ) -> Optional[Dict[str, Any]]:
+        from src.tools.context import ToolExecutionContext
+        from src.tools.telephony.deferred_transfer import commit_pending_deferred_transfer
+
+        session = session or await self.session_store.get_by_call_id(call_id)
+        if not session or not isinstance(getattr(session, "pending_deferred_transfer", None), dict):
+            return None
+
+        local_handoff_played = await self._play_deferred_transfer_local_handoff(call_id, session)
+        if not local_handoff_played:
+            logger.debug("Deferred transfer local handoff skipped", call_id=call_id)
+
+        await self._wait_for_deferred_transfer_audio_drain(call_id)
+
+        provider_name = getattr(session, "provider_name", None) or getattr(self.config, "default_provider", None)
+        context = ToolExecutionContext(
+            call_id=call_id,
+            caller_channel_id=getattr(session, "caller_channel_id", None) or call_id,
+            bridge_id=getattr(session, "bridge_id", None),
+            caller_number=getattr(session, "caller_number", None),
+            called_number=getattr(session, "called_number", None),
+            caller_name=getattr(session, "caller_name", None),
+            context_name=getattr(session, "context_name", None),
+            session_store=self.session_store,
+            ari_client=self.ari_client,
+            config=self.config.dict() if hasattr(self.config, "dict") else {},
+            provider_name=provider_name,
+        )
+        result = await commit_pending_deferred_transfer(context)
+        if result:
+            logger.info(
+                "Deferred transfer commit result",
+                call_id=call_id,
+                status=result.get("status"),
+                message=result.get("message"),
+            )
+        return result
+
+    def _deferred_transfer_local_handoff_providers(self) -> set[str]:
+        tools_cfg = getattr(self.config, "tools", {}) or {}
+        transfer_cfg = tools_cfg.get("transfer", {}) if isinstance(tools_cfg, dict) else {}
+        if not isinstance(transfer_cfg, dict):
+            transfer_cfg = {}
+
+        raw = transfer_cfg.get("local_handoff_audio_providers", ["deepgram"])
+        if raw is False or raw is None:
+            return set()
+        if raw is True:
+            raw = ["deepgram"]
+        if isinstance(raw, str):
+            raw = [item.strip() for item in raw.split(",")]
+        if not isinstance(raw, (list, tuple, set)):
+            raw = ["deepgram"]
+        return {str(item or "").strip().lower() for item in raw if str(item or "").strip()}
+
+    async def _play_deferred_transfer_local_handoff(self, call_id: str, session: "CallSession") -> bool:
+        provider_name = str(getattr(session, "provider_name", None) or getattr(self.config, "default_provider", "") or "").strip()
+        provider_key = (self._get_provider_kind(provider_name) or provider_name).strip().lower()
+        if provider_key not in self._deferred_transfer_local_handoff_providers():
+            return False
+
+        action = getattr(session, "pending_deferred_transfer", None)
+        if not isinstance(action, dict):
+            return False
+
+        description = str(action.get("description") or action.get("destination_key") or action.get("target") or "").strip()
+        if not description:
+            description = "your destination"
+
+        tools_cfg = getattr(self.config, "tools", {}) or {}
+        transfer_cfg = tools_cfg.get("transfer", {}) if isinstance(tools_cfg, dict) else {}
+        if not isinstance(transfer_cfg, dict):
+            transfer_cfg = {}
+        template = str(transfer_cfg.get("local_handoff_audio_template") or "Transferring you to {destination} now.").strip()
+        try:
+            message = template.format(destination=description)
+        except Exception:
+            message = f"Transferring you to {description} now."
+
+        try:
+            timeout_sec = float(transfer_cfg.get("local_handoff_audio_tts_timeout_sec", 3.0) or 3.0)
+        except (TypeError, ValueError):
+            timeout_sec = 3.0
+        timeout_sec = max(0.5, min(timeout_sec, 10.0))
+
+        try:
+            stream_info = self.streaming_playback_manager.active_streams.get(call_id)
+            if stream_info is not None:
+                stream_info["end_reason"] = "deferred-transfer-local-handoff"
+                await self.streaming_playback_manager.stop_streaming_playback(call_id)
+            self._provider_stream_queues.pop(call_id, None)
+            self._provider_stream_formats.pop(call_id, None)
+            self._provider_coalesce_buf.pop(call_id, None)
+            self._segment_tts_active.discard(call_id)
+        except Exception:
+            logger.debug("Failed to stop provider stream before local transfer handoff", call_id=call_id, exc_info=True)
+
+        audio = await self._local_ai_server_tts(call_id=call_id, text=message, timeout_sec=timeout_sec)
+        if not audio:
+            logger.warning(
+                "Deferred transfer local handoff TTS unavailable",
+                call_id=call_id,
+                provider=provider_name,
+            )
+            return False
+
+        playback_id = await self.playback_manager.play_audio(call_id, audio, "transfer-handoff")
+        if not playback_id:
+            logger.warning(
+                "Deferred transfer local handoff playback failed",
+                call_id=call_id,
+                provider=provider_name,
+            )
+            return False
+
+        wait_timeout = min(10.0, max(1.0, (len(audio) / 8000.0) + 1.0))
+        played = await self.playback_manager.wait_for_playback_end(
+            call_id,
+            playback_id,
+            timeout_sec=wait_timeout,
+        )
+        logger.info(
+            "Deferred transfer local handoff playback completed",
+            call_id=call_id,
+            provider=provider_name,
+            playback_id=playback_id,
+            played=played,
+            audio_bytes=len(audio),
+        )
+        return bool(played)
+
+    async def _wait_for_deferred_transfer_audio_drain(self, call_id: str) -> bool:
+        """Wait briefly for caller-facing transfer audio to leave the streaming path."""
+        tools_cfg = getattr(self.config, "tools", {}) or {}
+        transfer_cfg = tools_cfg.get("transfer", {}) if isinstance(tools_cfg, dict) else {}
+        if not isinstance(transfer_cfg, dict):
+            transfer_cfg = {}
+
+        try:
+            timeout_sec = float(transfer_cfg.get("deferred_audio_drain_timeout_sec", 5.0))
+        except (TypeError, ValueError):
+            timeout_sec = 5.0
+        try:
+            quiet_sec = float(transfer_cfg.get("deferred_audio_drain_quiet_ms", 500)) / 1000.0
+        except (TypeError, ValueError):
+            quiet_sec = 0.5
+        timeout_sec = max(0.0, min(timeout_sec, 30.0))
+        quiet_sec = max(0.0, min(quiet_sec, 5.0))
+
+        if timeout_sec <= 0:
+            return True
+
+        started_at = time.time()
+        quiet_started_at: Optional[float] = None
+        last_snapshot: Dict[str, Any] = {}
+
+        while (time.time() - started_at) < timeout_sec:
+            now = time.time()
+            pending_provider_chunks = 0
+            pending_stream_bytes = 0
+            pending_jitter_frames = 0
+            pending_remainder_bytes = 0
+            active_playbacks = 0
+            last_real_emit_ts: Optional[float] = None
+
+            try:
+                q = self._provider_stream_queues.get(call_id)
+                if q is not None:
+                    pending_provider_chunks = int(q.qsize())
+            except Exception:
+                pending_provider_chunks = 0
+
+            try:
+                spm = getattr(self, "streaming_playback_manager", None)
+                stream_info = (getattr(spm, "active_streams", {}) or {}).get(call_id) if spm else None
+                if stream_info:
+                    pending_stream_bytes = int(stream_info.get("buffered_bytes", 0) or 0)
+                    pending_jitter_frames = int(stream_info.get("jitter_depth", 0) or 0)
+                    emit_ts = stream_info.get("last_real_emit_ts")
+                    if emit_ts is not None:
+                        last_real_emit_ts = float(emit_ts)
+                remainders = getattr(spm, "frame_remainders", {}) if spm else {}
+                pending_remainder_bytes = len(remainders.get(call_id, b"") or b"")
+            except Exception:
+                pending_stream_bytes = 0
+                pending_jitter_frames = 0
+                pending_remainder_bytes = 0
+                last_real_emit_ts = None
+
+            try:
+                active_playbacks = len(await self.session_store.list_playbacks_for_call(call_id))
+            except Exception:
+                active_playbacks = 0
+
+            has_pending_audio = any(
+                (
+                    pending_provider_chunks > 0,
+                    pending_stream_bytes > 0,
+                    pending_jitter_frames > 0,
+                    pending_remainder_bytes > 0,
+                    active_playbacks > 0,
+                )
+            )
+
+            last_snapshot = {
+                "pending_provider_chunks": pending_provider_chunks,
+                "pending_stream_bytes": pending_stream_bytes,
+                "pending_jitter_frames": pending_jitter_frames,
+                "pending_remainder_bytes": pending_remainder_bytes,
+                "active_playbacks": active_playbacks,
+            }
+
+            if has_pending_audio:
+                quiet_started_at = None
+            else:
+                if quiet_started_at is None:
+                    quiet_started_at = now
+                quiet_elapsed = now - quiet_started_at
+                emit_elapsed = quiet_elapsed
+                if last_real_emit_ts is not None:
+                    emit_elapsed = now - last_real_emit_ts
+                if quiet_elapsed >= quiet_sec and emit_elapsed >= quiet_sec:
+                    logger.info(
+                        "Deferred transfer audio drain complete",
+                        call_id=call_id,
+                        wait_seconds=round(now - started_at, 3),
+                        quiet_ms=int(quiet_sec * 1000),
+                    )
+                    return True
+
+            await asyncio.sleep(0.02)
+
+        logger.warning(
+            "Deferred transfer audio drain timed out; committing transfer",
+            call_id=call_id,
+            timeout_sec=timeout_sec,
+            quiet_ms=int(quiet_sec * 1000),
+            **last_snapshot,
+        )
+        return False
 
     async def _execute_pre_call_tools(
         self,

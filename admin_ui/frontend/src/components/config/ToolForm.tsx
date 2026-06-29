@@ -1004,16 +1004,6 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
         });
     };
 
-    const unsetNestedConfig = (section: string, field: string) => {
-        const next = { ...config };
-        const current = next[section];
-        if (!current || typeof current !== 'object') return;
-        const copy = { ...current };
-        delete copy[field];
-        next[section] = copy;
-        onChange(next);
-    };
-
     const updateByContextMap = (section: string, key: string, contextName: string, value: string) => {
         const next = { ...config };
         const toolCfg = { ...(next[section] || {}) };
@@ -1218,12 +1208,17 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
     // Transfer Destinations Management
     const handleEditDestination = (key: string, data: any) => {
         setEditingDestination(key);
-        setDestinationForm({ key, ...data });
+        setDestinationForm({
+            key,
+            ...data,
+            dialplan_context: data?.dialplan_context ?? data?.context ?? '',
+            live_agent: showLiveAgentRoutingAdvanced ? (data?.live_agent ?? false) : false,
+        });
     };
 
     const handleAddDestination = () => {
         setEditingDestination('new_destination');
-        setDestinationForm({ key: '', type: 'extension', target: '', description: '', attended_allowed: false, live_agent: false });
+        setDestinationForm({ key: '', type: 'extension', target: '', description: '', dialplan_context: '', attended_allowed: false, live_agent: false });
     };
 
     const handleSaveDestination = () => {
@@ -1237,6 +1232,9 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
         }
 
         const { key, ...data } = destinationForm;
+        if (!showLiveAgentRoutingAdvanced) {
+            delete data.live_agent;
+        }
         destinations[key] = data;
 
         updateNestedConfig('transfer', 'destinations', destinations);
@@ -1295,14 +1293,70 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
 
 	                    {config.transfer?.enabled !== false && (
 	                        <div className="mt-4 space-y-4">
-	                            <FormInput
-	                                label="Channel Technology"
-	                                value={config.transfer?.technology || 'SIP'}
-	                                onChange={(e) => updateNestedConfig('transfer', 'technology', e.target.value)}
-	                                tooltip="Channel technology for extension transfers (SIP, PJSIP, IAX2, etc.). Default: SIP"
-	                                placeholder="SIP"
-	                            />
-                                <FormSwitch
+		                            <FormInput
+		                                label="Channel Technology"
+		                                value={config.transfer?.technology || 'PJSIP'}
+		                                onChange={(e) => updateNestedConfig('transfer', 'technology', e.target.value.trim() || 'PJSIP')}
+		                                tooltip="Channel technology for extension transfers (PJSIP, SIP, IAX2, etc.). Default: PJSIP"
+		                                placeholder="PJSIP"
+		                            />
+                                    <FormSwitch
+                                        label="Defer Transfer Until Playback Completes"
+                                        description="Speak the handoff message before executing blind, live-agent, or attended transfer actions."
+                                        checked={config.transfer?.defer_until_playback_complete ?? true}
+                                        onChange={(e) => updateNestedConfig('transfer', 'defer_until_playback_complete', e.target.checked)}
+                                        className="mb-0 border border-border rounded-lg p-3 bg-background/50"
+                                    />
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                        <FormSelect
+                                            label="Deferred Transfer Strategy"
+                                            value={config.transfer?.deferred_strategy || 'drain_then_dial'}
+                                            onChange={(e) => updateNestedConfig('transfer', 'deferred_strategy', e.target.value)}
+                                            options={[
+                                                { value: 'drain_then_dial', label: 'Drain, then dial' },
+                                                { value: 'predial_then_bridge', label: 'Pre-dial, then bridge' },
+                                            ]}
+                                            tooltip="Drain, then dial keeps the existing behavior. Pre-dial starts the destination leg while the handoff message plays, then bridges after playback completes."
+                                        />
+                                        <FormInput
+                                            label="Predial Bridge Wait (seconds)"
+                                            type="number"
+                                            value={config.transfer?.predial_bridge_wait_timeout_sec ?? 10}
+                                            onChange={(e) => updateNestedConfig('transfer', 'predial_bridge_wait_timeout_sec', parseFloat(e.target.value) || 10)}
+                                            tooltip="How long to wait after the handoff message for a pre-dialed destination to answer before falling back to the regular dialplan transfer."
+                                        />
+                                        <FormInput
+                                            label="Predial Dial Timeout (seconds)"
+                                            type="number"
+                                            value={config.transfer?.predial_timeout_seconds ?? 30}
+                                            onChange={(e) => updateNestedConfig('transfer', 'predial_timeout_seconds', parseInt(e.target.value) || 30)}
+                                            tooltip="How long Asterisk should keep ringing the pre-dialed destination leg."
+                                        />
+                                    </div>
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                        <FormInput
+                                            label="Default Extension Context"
+                                            value={config.transfer?.extension_context || 'from-internal'}
+                                            onChange={(e) => updateNestedConfig('transfer', 'extension_context', e.target.value)}
+                                            tooltip="Default Asterisk dialplan context for extension destinations. Destination-level context overrides this."
+                                            placeholder="from-internal"
+                                        />
+                                        <FormInput
+                                            label="Default Queue Context"
+                                            value={config.transfer?.queue_context || 'ext-queues'}
+                                            onChange={(e) => updateNestedConfig('transfer', 'queue_context', e.target.value)}
+                                            tooltip="Default Asterisk dialplan context for queue destinations. Destination-level context overrides this."
+                                            placeholder="ext-queues"
+                                        />
+                                        <FormInput
+                                            label="Default Ring Group Context"
+                                            value={config.transfer?.ringgroup_context || 'ext-group'}
+                                            onChange={(e) => updateNestedConfig('transfer', 'ringgroup_context', e.target.value)}
+                                            tooltip="Default Asterisk dialplan context for ring group destinations. Destination-level context overrides this."
+                                            placeholder="ext-group"
+                                        />
+                                    </div>
+	                                <FormSwitch
                                     label="Advanced: Route Live Agent via Destination"
                                     description={
                                         hasLiveAgents
@@ -1310,14 +1364,24 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                                             : "No Live Agents configured. Enable to select which transfer destination should handle live-agent requests."
                                     }
                                     checked={showLiveAgentRoutingAdvanced}
-                                    onChange={(e) => {
-                                        const enabled = e.target.checked;
-                                        setShowLiveAgentRoutingAdvanced(enabled);
-                                        if (!enabled) {
-                                            // Disable override behavior and reduce config confusion.
-                                            unsetNestedConfig('transfer', 'live_agent_destination_key');
-                                        }
-                                    }}
+	                                    onChange={(e) => {
+	                                        const enabled = e.target.checked;
+	                                        setShowLiveAgentRoutingAdvanced(enabled);
+	                                        if (!enabled) {
+	                                            const cleanedDestinations = Object.fromEntries(
+	                                                Object.entries(config.transfer?.destinations || {}).map(([key, dest]: [string, any]) => {
+	                                                    if (!dest || typeof dest !== 'object') return [key, dest];
+	                                                    const nextDest = { ...dest };
+	                                                    delete nextDest.live_agent;
+	                                                    return [key, nextDest];
+	                                                })
+	                                            );
+	                                            const nextTransfer = { ...(config.transfer || {}), destinations: cleanedDestinations };
+	                                            delete nextTransfer.live_agent_destination_key;
+	                                            onChange({ ...config, transfer: nextTransfer });
+	                                            setDestinationForm({ ...destinationForm, live_agent: false });
+	                                        }
+	                                    }}
                                     className="mb-0 border border-border rounded-lg p-3 bg-background/50"
                                 />
                                 {showLiveAgentRoutingAdvanced && (
@@ -1325,17 +1389,24 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
 	                                    label="Live Agent Destination Key (Advanced)"
 	                                    value={config.transfer?.live_agent_destination_key || ''}
 	                                    onChange={(e) => updateNestedConfig('transfer', 'live_agent_destination_key', e.target.value)}
-	                                    options={[
-	                                        { value: '', label: 'Not set (auto: destinations.live_agent or key live_agent)' },
-	                                        ...Object.entries(config.transfer?.destinations || {})
-	                                            .filter(([key, dest]: [string, any]) => key === 'live_agent' || Boolean(dest?.live_agent))
-	                                            .map(([key]) => key)
-	                                            .sort()
-	                                            .map((key) => ({ value: key, label: key })),
-	                                    ]}
+		                                    options={[
+			                                        { value: '', label: 'Not set (auto: destinations.live_agent or key live_agent)' },
+			                                        ...Object.entries(config.transfer?.destinations || {})
+			                                            .filter(([, dest]) => dest && typeof dest === 'object')
+			                                            .map(([key, dest]: [string, any]) => ({
+	                                                        key,
+	                                                        type: dest?.type || 'extension',
+	                                                        target: dest?.target || '',
+                                                    }))
+		                                            .sort((a, b) => a.key.localeCompare(b.key))
+		                                            .map(({ key, type, target }) => ({
+                                                        value: key,
+                                                        label: target ? `${key} (${type}: ${target})` : `${key} (${type})`,
+                                                    })),
+		                                    ]}
 	                                    tooltip="Advanced/legacy override for live_agent_transfer. When set, live-agent requests route to this destination key instead of Live Agents."
 	                                />
-                                )}
+	                            )}
 	                            <div className="flex justify-between items-center">
 	                                <FormLabel>Destinations</FormLabel>
 	                                <button
@@ -1350,17 +1421,25 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
 	                                {Object.entries(config.transfer?.destinations || {}).map(([key, dest]: [string, any]) => {
 	                                    // AAVA-199: Guard against null/undefined destinations
 	                                    if (!dest || typeof dest !== 'object') return null;
-	                                    const destType = dest.type || 'extension';
-	                                    const destTarget = dest.target || '';
-	                                    const destDescription = dest.description || '';
-	                                    return (
+		                                    const destType = dest.type || 'extension';
+		                                    const destTarget = dest.target || '';
+		                                    const destDescription = dest.description || '';
+                                            const defaultContext = destType === 'queue'
+	                                                ? (config.transfer?.queue_context || 'ext-queues')
+	                                                : destType === 'ringgroup'
+	                                                    ? (config.transfer?.ringgroup_context || 'ext-group')
+	                                                    : (config.transfer?.extension_context || 'from-internal');
+	                                            const explicitContext = dest.dialplan_context || dest.context || '';
+	                                            const destContext = explicitContext || defaultContext;
+		                                    return (
 	                                    <div key={key} className="flex items-center justify-between p-3 bg-accent/30 rounded border border-border/50">
 	                                        <div>
 	                                            <div className="font-medium text-sm">{key}</div>
 	                                            <div className="text-xs text-muted-foreground">
-	                                                {destType} • {destTarget} • {destDescription}
-	                                                {destType === 'extension' && dest.attended_allowed ? ' • attended' : ''}
-	                                                {destType === 'extension' && showLiveAgentRoutingAdvanced && dest.live_agent ? ' • live-agent' : ''}
+		                                                {destType} • {destTarget} • {destDescription}
+                                                        {destContext ? ` • ctx: ${destContext}` : ''}
+		                                                {destType === 'extension' && dest.attended_allowed ? ' • attended' : ''}
+		                                                {showLiveAgentRoutingAdvanced && dest.live_agent ? ' • live-agent' : ''}
 	                                            </div>
 	                                        </div>
 	                                        <div className="flex items-center gap-1">
@@ -3308,28 +3387,39 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                             onChange={(e) => setDestinationForm({ ...destinationForm, attended_allowed: e.target.checked })}
                         />
                     )}
-	                    {destinationForm.type === 'extension' && (
-	                        <FormSwitch
-	                            label="Use As Live Agent Destination"
-	                            description={
-	                                showLiveAgentRoutingAdvanced
-	                                    ? "Marks this destination as the live-agent target fallback when no explicit live_agent_destination_key is set."
-	                                    : "Disabled. Enable 'Advanced: Route Live Agent via Destination' to use destination-based live-agent routing."
-	                            }
-	                            checked={destinationForm.live_agent ?? false}
-	                            onChange={(e) => setDestinationForm({ ...destinationForm, live_agent: e.target.checked })}
-	                            disabled={!showLiveAgentRoutingAdvanced}
-	                        />
-	                    )}
-                    <FormInput
-                        label="Target Number"
-                        value={destinationForm.target || ''}
-                        onChange={(e) => setDestinationForm({ ...destinationForm, target: e.target.value })}
-                        placeholder="e.g., 6000"
-                    />
-                    <FormInput
-                        label="Description"
-                        value={destinationForm.description || ''}
+		                    <FormSwitch
+		                        label="Use As Live Agent Destination"
+		                        description={
+		                            showLiveAgentRoutingAdvanced
+		                                ? "Marks this destination as the live-agent target fallback when no explicit live_agent_destination_key is set."
+		                                : "Disabled. Enable 'Advanced: Route Live Agent via Destination' to use destination-based live-agent routing."
+		                        }
+			                        checked={showLiveAgentRoutingAdvanced ? (destinationForm.live_agent ?? false) : false}
+			                        onChange={(e) => setDestinationForm({ ...destinationForm, live_agent: e.target.checked })}
+		                        disabled={!showLiveAgentRoutingAdvanced}
+		                    />
+	                    <FormInput
+	                        label="Target Number"
+	                        value={destinationForm.target || ''}
+	                        onChange={(e) => setDestinationForm({ ...destinationForm, target: e.target.value })}
+	                        placeholder="e.g., 6000"
+	                    />
+                        <FormInput
+                            label="Dialplan Context"
+                            value={destinationForm.dialplan_context || ''}
+                            onChange={(e) => setDestinationForm({ ...destinationForm, dialplan_context: e.target.value })}
+                            placeholder={
+                                destinationForm.type === 'queue'
+                                    ? 'ext-queues'
+                                    : destinationForm.type === 'ringgroup'
+                                        ? 'ext-group'
+                                        : 'from-internal'
+                            }
+                            tooltip="Optional per-destination Asterisk dialplan context. Leave blank to use the transfer tool default for this destination type."
+                        />
+	                    <FormInput
+	                        label="Description"
+	                        value={destinationForm.description || ''}
                         onChange={(e) => setDestinationForm({ ...destinationForm, description: e.target.value })}
                         placeholder="e.g., Sales Support"
                     />

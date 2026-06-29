@@ -1274,6 +1274,29 @@ class StreamingPlaybackManager:
         except Exception:
             min_need = self.min_start_chunks
         available_frames = self._estimate_available_frames(call_id, jitter_buffer, include_remainder=True)
+        buffered_bytes = 0
+        with suppress(TypeError, ValueError):
+            buffered_bytes = int(stream_info.get('buffered_bytes', 0) or 0)
+        has_closed_tail = (
+            available_frames > 0
+            or buffered_bytes > 0
+            or bool(self.frame_remainders.get(call_id))
+            or not jitter_buffer.empty()
+        )
+        if bool(stream_info.get('producer_closed')) and has_closed_tail:
+            self._startup_ready[call_id] = True
+            stream_info['startup_ready'] = True
+            try:
+                logger.info(
+                    "Streaming startup released short final segment",
+                    call_id=call_id,
+                    stream_id=stream_id,
+                    buffered_frames=available_frames,
+                    min_start_chunks=min_need,
+                )
+            except Exception:
+                pass
+            return True
         if available_frames < min_need:
             return False
         self._startup_ready[call_id] = True
@@ -3193,7 +3216,7 @@ class StreamingPlaybackManager:
                         error=str(e))
 
     
-    async def stop_streaming_playback(self, call_id: str) -> bool:
+    async def stop_streaming_playback(self, call_id: str, *, drain: bool = False, drain_timeout: float = 120.0) -> bool:
         """Stop streaming playback for a call."""
         try:
             stream_info = self.active_streams.get(call_id)
@@ -3201,27 +3224,55 @@ class StreamingPlaybackManager:
                 logger.warning("No active streaming to stop", call_id=call_id)
                 return False
             stream_id = stream_info.get('stream_id') or ''
-            # Cancel streaming task
-            try:
+
+            if drain:
                 task = stream_info.get('streaming_task')
-                if task:
-                    task.cancel()
-            except Exception:
-                pass
-            # Cancel pacer task
-            try:
-                ptask = stream_info.get('pacer_task')
-                if ptask:
-                    ptask.cancel()
-            except Exception:
-                pass
-            # Cancel keepalive task
-            if call_id in self.keepalive_tasks:
+                if task and not task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=max(0.5, float(drain_timeout)))
+                        logger.info("🎵 STREAMING PLAYBACK - Drained", call_id=call_id, stream_id=stream_id)
+                        return True
+                    except (asyncio.TimeoutError, TypeError, ValueError):
+                        logger.warning("Streaming drain timed out; aborting playback", call_id=call_id, stream_id=stream_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.debug("Streaming drain failed; aborting playback", call_id=call_id, stream_id=stream_id, exc_info=True)
+
+            cancelled_tasks = []
+            seen_tasks = set()
+
+            def _cancel_task(task: Any) -> None:
+                if not task or not hasattr(task, "cancel"):
+                    return
+                task_id = id(task)
+                if task_id in seen_tasks:
+                    return
+                seen_tasks.add(task_id)
                 try:
-                    self.keepalive_tasks[call_id].cancel()
+                    if not task.done():
+                        task.cancel()
+                        cancelled_tasks.append(task)
                 except Exception:
                     pass
-                self.keepalive_tasks.pop(call_id, None)
+
+            _cancel_task(stream_info.get('streaming_task'))
+            _cancel_task(stream_info.get('pacer_task'))
+            _cancel_task(stream_info.get('keepalive_task'))
+            _cancel_task(self.keepalive_tasks.pop(call_id, None))
+
+            if cancelled_tasks:
+                try:
+                    _, pending = await asyncio.wait(cancelled_tasks, timeout=2.0)
+                    if pending:
+                        logger.debug(
+                            "Streaming stop tasks did not settle before cleanup",
+                            call_id=call_id,
+                            stream_id=stream_id,
+                            pending_tasks=len(pending),
+                        )
+                except Exception:
+                    logger.debug("Failed while waiting for streaming stop tasks", call_id=call_id, exc_info=True)
             # Cleanup resources and emit summaries
             await self._cleanup_stream(call_id, stream_id)
             logger.info("🎵 STREAMING PLAYBACK - Stopped", call_id=call_id, stream_id=stream_id)
